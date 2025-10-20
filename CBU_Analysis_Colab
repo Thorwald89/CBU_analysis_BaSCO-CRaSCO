@@ -1,0 +1,511 @@
+import pandas as pd
+import numpy as np
+from scipy import stats
+import statsmodels.api as sm
+from statsmodels.formula.api import ols
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+from scipy.stats import f_oneway
+
+# =========================================================================
+# === 🚨 SEZIONE 1: CARICAMENTO DATI REALI E PULIZIA FORMATO (FINAL FIX) 🚨 ===
+# =========================================================================
+
+try:
+    # Assicurati che 'Database.xlsx' sia nello stesso percorso dello script
+    df = pd.read_excel('Database.xlsx', sheet_name='Totale Normalizzati')
+    print("Database.xlsx caricato con successo dal foglio 'Totale Normalizzati'!")
+except Exception as e:
+    print(f"ERRORE CRITICO DI CARICAMENTO. Dettaglio: {e}")
+    raise
+
+# 1. Pulizia Nomi Colonne e Ridenominazione
+df.columns = df.columns.str.strip()
+df.columns = df.columns.str.replace(' ', '_', regex=False)
+
+# Rinomina colonne per standardizzare la nomenclatura (assicurati che i nomi siano corretti nel tuo file)
+df.rename(columns={
+    'CD34': 'CD34_RESIDUO',
+    'VITALITA_CD34': "VITALITA_CD34"
+}, inplace=True)
+
+# *** FIX CRITICO: Mappa PN a NC e CS/TC a CS ***
+df['Parto'] = df['Parto'].replace({'TC': 'CS', 'PN': 'NC', 'CS': 'CS'})
+df = df.dropna(subset=['Parto']) # Rimuove le righe con 'nan' nella colonna Parto
+
+# 2. CONVERSIONE FORZATA DELLE COLONNE NUMERICHE
+numeric_cols = [
+    'Eta_Donatrice', 'Sett_Gestazional', 'Peso_Neonato', 'Volum_CB_iniziale',
+    'TNC_Normalizzato', 'CD34_Normalizzato', 'NRBC_PERC', 'VITALITA_CD34',
+    'Volume_Finale', 'CONC_TNC_FINALE', 'Gr_Placenta'
+]
+
+for col in numeric_cols:
+    if col in df.columns:
+        # Pulizia: Sostituzione della virgola decimale e conversione forzata
+        df.loc[:, col] = df[col].apply(lambda x: str(x).replace(',', '.'))
+        df.loc[:, col] = pd.to_numeric(df[col], errors='coerce')
+    else:
+        # Se la colonna non è trovata, la gestiamo come avviso e andiamo avanti se possibile
+        print(f"AVVISO: La colonna '{col}' non è stata trovata. Continua l'analisi.")
+        if col in df.columns: # Rimuove da numeric_cols se non esiste dopo il check
+            numeric_cols.remove(col)
+
+
+# 3. GESTIONE DEI VALORI MANCANTI (IMPUTAZIONE MEDIANA)
+df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median())
+# Converto Peso_Neonato in grammi (moltiplicato per 1000) se la sua media è molto bassa (e.g., < 50)
+if df['Peso_Neonato'].mean() < 50:
+    df['Peso_Neonato'] = df['Peso_Neonato'] * 1000
+
+# 4. CALCOLO DELLE COLONNE DERIVATE
+df['TNC_Iniziale_Totale'] = df['TNC_Normalizzato'] * df['Volum_CB_iniziale'] / 10**6
+
+# Inizializzazione pulita dei sottogruppi
+df_nc = df[df['Parto'] == 'NC']
+df_cs = df[df['Parto'] == 'CS']
+
+# *** PREPARAZIONE E FILTRAGGIO CRASCO (AGGIUNTO FILTRO EST) ***
+df_crasco = df.dropna(subset=['CRASCO'])
+
+# >>> AGGIUNTO IL FILTRO PER ESCLUDERE 'EST' DA TUTTE LE ANALISI <<<
+df_crasco = df_crasco[df_crasco['CRASCO'] != 'EST'].copy()
+
+crasco_counts = df_crasco['CRASCO'].value_counts()
+# Filtriamo i centri con meno di 5 donazioni per rendere Tukey's più robusto
+crasco_to_keep = crasco_counts[crasco_counts >= 5].index
+df_crasco_filtered = df_crasco[df_crasco['CRASCO'].isin(crasco_to_keep)].copy()
+# **********************************************************************************************************
+
+
+# Debug per la conferma finale
+print("-" * 50)
+print(f"DEBUG DATI (DOPO FIX): Righe nel sottogruppo NC: {len(df_nc)}")
+print(f"DEBUG DATI (DOPO FIX): Righe nel sottogruppo CS: {len(df_cs)}")
+print(f"DEBUG DATI (DOPO FIX): Valori unici colonna Parto: {df['Parto'].unique()}")
+print("-" * 50)
+
+
+# =========================================================================
+# === SEZIONE 2: ANALISI 1 (T-TEST E CARATTERISTICHE DI BASE) ===
+# =========================================================================
+
+print("\n\n" + "="*80)
+print("ANALISI 1: CARATTERISTICHE DEL CAMPIONE E CONFRONTI NC vs CS (T-TEST)")
+print("I risultati 'TNC_Normalizzato' e 'CD34_Normalizzato' sono in x 10^3/µl")
+print("="*80)
+
+variables_to_compare = [
+    'Eta_Donatrice', 'Sett_Gestazional', 'Peso_Neonato', 'Volum_CB_iniziale',
+    'TNC_Normalizzato', 'CD34_Normalizzato', 'NRBC_PERC'
+]
+
+summary_data = []
+
+for var in variables_to_compare:
+    # Prepara dati per t-test
+    data_nc = df_nc[var].dropna()
+    data_cs = df_cs[var].dropna()
+
+    mean_nc = data_nc.mean()
+    std_nc = data_nc.std()
+    mean_cs = data_cs.mean()
+    std_cs = data_cs.std()
+
+    t_stat, p_value = stats.ttest_ind(data_nc, data_cs, equal_var=False)
+
+    # Formattazione per la tabella
+    factor = 10**3 if 'TNC' in var or 'CD34' in var else 1
+    # Peso neonato è ora in grammi se corretto sopra
+    peso_unit = ' (grammi)' if var == 'Peso_Neonato' else ''
+    unit = ' (x 10^3/µl)' if 'TNC' in var or 'CD34' in var else peso_unit
+
+    summary_data.append({
+        'Variabile': var + unit,
+        'NC (Media ± DS)': f"{(mean_nc/factor):.2f} ± {(std_nc/factor):.2f}",
+        'CS (Media ± DS)': f"{(mean_cs/factor):.2f} ± {(std_cs/factor):.2f}",
+        'P-value': f"{p_value:.4f}",
+        'Significatività': 'Sì' if p_value < 0.05 else 'No'
+    })
+
+df_summary = pd.DataFrame(summary_data)
+print("Risultati T-test NC vs CS per le variabili chiave:")
+print(df_summary.to_markdown(index=False))
+
+# ---
+## Analisi 2: Correlazione Peso Neonato
+
+print("\n\n" + "="*80)
+print("ANALISI 2: CORRELAZIONE PESO NEONATO vs. RESA CELLULARE (PEARSON)")
+print("="*80)
+
+correlation_results = []
+target_variables = ['TNC_Normalizzato', 'CD34_Normalizzato']
+groups = {'Totale': df, 'NC': df_nc, 'CS': df_cs}
+
+for group_name, group_df in groups.items():
+    if len(group_df) < 2:
+        print(f"AVVISO: Impossibile calcolare Correlazione per il gruppo {group_name} (meno di 2 osservazioni).")
+        continue
+
+    for target in target_variables:
+        # Prepara dati per correlazione (assicurati che non ci siano NaN)
+        temp_df = group_df[['Peso_Neonato', target]].dropna()
+
+        # Verifica finale della dimensione dopo dropna()
+        if len(temp_df) < 2:
+            corr, p = np.nan, np.nan
+
+        else:
+            corr, p = stats.pearsonr(temp_df['Peso_Neonato'], temp_df[target])
+
+        correlation_results.append({
+            'Gruppo': group_name,
+            'Variabile': target.replace('_Normalizzato', ''),
+            'Pearson (r)': f"{corr:.4f}",
+            'P-value': f"{p:.4f}",
+            'Significatività': 'Sì' if p < 0.05 else 'No'
+        })
+
+df_corr = pd.DataFrame(correlation_results)
+print("Correlazione tra Peso Neonato e TNC/CD34 per Gruppo:")
+print(df_corr.to_markdown(index=False))
+
+
+# =========================================================================
+# === SEZIONE 4: ANALISI 4 (CORRELAZIONE PESO PLACENTA) 🚨 ===
+# =========================================================================
+
+print("\n\n" + "="*80)
+print("ANALISI 4: CORRELAZIONE PESO PLACENTA vs. RESA CELLULARE (PEARSON)")
+print("="*80)
+
+correlation_results_placenta = []
+target_variables = ['TNC_Normalizzato', 'CD34_Normalizzato']
+groups = {'Totale': df, 'NC': df_nc, 'CS': df_cs}
+
+for group_name, group_df in groups.items():
+    if len(group_df) < 2:
+        continue
+
+    for target in target_variables:
+        # Assicuriamoci che entrambe le colonne siano presenti
+        if 'Gr_Placenta' in group_df.columns and target in group_df.columns:
+            temp_df = group_df[['Gr_Placenta', target]].dropna()
+
+            if len(temp_df) >= 2:
+                corr, p = stats.pearsonr(temp_df['Gr_Placenta'], temp_df[target])
+            else:
+                corr, p = np.nan, np.nan
+        else:
+            corr, p = np.nan, np.nan
+
+        correlation_results_placenta.append({
+            'Gruppo': group_name,
+            'Variabile': target.replace('_Normalizzato', ''),
+            'Pearson (r)': f"{corr:.4f}",
+            'P-value': f"{p:.4f}",
+            'Significatività': 'Sì' if p < 0.05 else 'No'
+        })
+
+df_corr_placenta = pd.DataFrame(correlation_results_placenta)
+print("Correlazione tra Peso Placenta e TNC/CD34 per Gruppo:")
+print(df_corr_placenta.to_markdown(index=False))
+
+
+# =========================================================================
+# === 🚨 SEZIONE 5: REGRESSIONE LINEARE MULTIPLA (TNC_Iniziale_Totale) 🚨 ===
+# =========================================================================
+
+print("\n\n" + "="*80)
+print("ANALISI 5: REGRESSIONE LINEARE MULTIPLA (TNC_Iniziale_Totale)")
+print("Obiettivo: Identificare i predittori significativi della RESA TOTALE (Milioni di TNC)")
+print("="*80)
+
+# Variabile dipendente (Y): TNC Iniziale Totale (in milioni)
+Y_total = df['TNC_Iniziale_Totale']
+
+# Variabili indipendenti (X): Includiamo Peso Placenta e altri predittori chiave
+X_total = df[['Eta_Donatrice', 'Sett_Gestazional', 'Volum_CB_iniziale', 'Gr_Placenta', 'Parto']]
+
+# Conversione di 'Parto' (NC/CS) in variabili fittizie (dummies).
+X_total = pd.get_dummies(X_total, columns=['Parto'], drop_first=True)
+X_total.rename(columns={'Parto_NC': 'Parto_NC'}, inplace=True)
+
+# Aggiungiamo l'intercetta (costante) al modello
+X_total = sm.add_constant(X_total)
+
+# Creazione e addestramento del modello
+model_total = sm.OLS(Y_total, X_total.astype(float), hasconst=True)
+results_total = model_total.fit()
+
+# Estrazione e formattazione dei risultati
+regression_summary_total = pd.DataFrame({
+    'Variabile': results_total.params.index,
+    'Coefficiente (Beta)': results_total.params.values.round(4),
+    'Errore Standard': results_total.bse.values.round(4),
+    'P-value': results_total.pvalues.values.round(4)
+})
+
+# Aggiunta di una colonna per la significatività
+regression_summary_total['Significatività (P<0.05)'] = np.where(regression_summary_total['P-value'] < 0.05, 'Sì', 'No')
+
+print(f"R-squared del Modello (Potere Esplicativo): {results_total.rsquared:.4f}")
+print("Risultati del Modello di Regressione per TNC_Iniziale_Totale (Milioni):")
+print(regression_summary_total.to_markdown(index=False))
+
+
+
+# =========================================================================
+# === 🚨 SEZIONE 6: ANALISI PER CENTRO CRASCO (STATISTICHE E ANOVA) 🚨 ===
+# =========================================================================
+
+print("\n\n" + "="*80)
+print("ANALISI 6: CONFRONTO DELLA RESA CELLULARE PER CENTRO CRASCO")
+print("Obiettivo: Valutare la variabilità della resa TNC e CD34 tra gli ospedali.")
+print("="*80)
+
+# --- 6.1 Statistiche Descrittive per CRASCO ---
+
+df_clean = df_crasco_filtered.copy() # Ora usa df_crasco_filtered (che esclude EST)
+
+if 'CRASCO' not in df.columns:
+    print("ERRORE: La colonna 'CRASCO' non è stata trovata nel DataFrame.")
+else:
+    # Calcolo delle statistiche riassuntive
+    crasco_summary = df_clean.groupby('CRASCO').agg(
+        Conteggio=('CRASCO', 'size'),
+        TNC_Media=('TNC_Normalizzato', 'mean'),
+        TNC_DS=('TNC_Normalizzato', 'std'),
+        CD34_Media=('CD34_Normalizzato', 'mean'),
+        CD34_DS=('CD34_Normalizzato', 'std')
+    ).reset_index()
+
+    # Formattazione per la stampa
+    crasco_summary['TNC_Media'] = crasco_summary['TNC_Media'].map('{:.3f}'.format)
+    crasco_summary['TNC_DS'] = crasco_summary['TNC_DS'].map('{:.3f}'.format)
+    crasco_summary['CD34_Media'] = crasco_summary['CD34_Media'].map('{:.3f}'.format)
+    crasco_summary['CD34_DS'] = crasco_summary['CD34_DS'].map('{:.3f}'.format)
+
+    print("--- 6.1 Statistiche Descrittive per CRASCO ---")
+    print(crasco_summary.to_markdown(index=False))
+
+
+    # --- 6.2 ANOVA per TNC e CD34 vs. CRASCO ---
+
+    print("\n--- 6.2 ANOVA (Analisi della Varianza) per Varianza Inter-Centro ---")
+
+    anova_results = []
+
+    # Esegue ANOVA per TNC
+    try:
+        model_tnc = ols('TNC_Normalizzato ~ C(CRASCO)', data=df_clean).fit()
+        anova_tnc = sm.stats.anova_lm(model_tnc, typ=2)
+        p_value_tnc = anova_tnc['PR(>F)']['C(CRASCO)']
+
+        anova_results.append({
+            'Variabile': 'TNC_Normalizzato',
+            'P-value (ANOVA)': f"{p_value_tnc:.4f}",
+            'Significatività (P<0.05)': 'Sì' if p_value_tnc < 0.05 else 'No'
+        })
+    except ValueError as e:
+         anova_results.append({'Variabile': 'TNC_Normalizzato', 'P-value (ANOVA)': 'Errore', 'Significatività (P<0.05)': str(e)})
+
+
+    # Esegue ANOVA per CD34
+    try:
+        model_cd34 = ols('CD34_Normalizzato ~ C(CRASCO)', data=df_clean).fit()
+        anova_cd34 = sm.stats.anova_lm(model_cd34, typ=2)
+        p_value_cd34 = anova_cd34['PR(>F)']['C(CRASCO)']
+
+        anova_results.append({
+            'Variabile': 'CD34_Normalizzato',
+            'P-value (ANOVA)': f"{p_value_cd34:.4f}",
+            'Significatività (P<0.05)': 'Sì' if p_value_cd34 < 0.05 else 'No'
+        })
+    except ValueError as e:
+         anova_results.append({'Variabile': 'CD34_Normalizzato', 'P-value (ANOVA)': 'Errore', 'Significatività (P<0.05)': str(e)})
+
+    df_anova = pd.DataFrame(anova_results)
+    print(df_anova.to_markdown(index=False))
+
+
+# =========================================================================
+# === 🚨 SEZIONE 7: ANALISI DI VITALITÀ E TEST POST-HOC CRASCO 🚨 ===
+# =========================================================================
+
+print("\n\n" + "="*80)
+print("ANALISI 7: VITALITÀ CD34 PER CRASCO E TEST POST-HOC (TUKEY)")
+print("Obiettivo: Valutare le differenze significative tra le coppie di centri.")
+print("="*80)
+
+# --- 7.1 Statistiche Descrittive e ANOVA per VITALITA_CD34 ---
+
+print("\n--- 7.1 Vitalità CD34 per CRASCO ---")
+
+if 'VITALITA_CD34' not in df_crasco_filtered.columns:
+    print("ERRORE: Colonna 'VITALITA_CD34' non trovata.")
+else:
+    vitalita_summary = df_crasco_filtered.groupby('CRASCO').agg(
+        Conteggio=('CRASCO', 'size'),
+        Vitalita_Media=('VITALITA_CD34', 'mean'),
+        Vitalita_DS=('VITALITA_CD34', 'std')
+    ).reset_index()
+
+    vitalita_summary['Vitalita_Media'] = vitalita_summary['Vitalita_Media'].map('{:.2f}'.format)
+    vitalita_summary['Vitalita_DS'] = vitalita_summary['Vitalita_DS'].map('{:.2f}'.format)
+
+    # Esegue ANOVA per Vitalità
+    model_vitalita = ols('VITALITA_CD34 ~ C(CRASCO)', data=df_crasco_filtered).fit()
+    anova_vitalita = sm.stats.anova_lm(model_vitalita, typ=2)
+    p_value_vitalita = anova_vitalita['PR(>F)']['C(CRASCO)']
+
+    print("Statistiche Descrittive Vitalità CD34:")
+    print(vitalita_summary.to_markdown(index=False))
+
+    print("\nRisultati ANOVA per VITALITA_CD34:")
+    print(f"P-value (ANOVA) Vitalità vs CRASCO: {p_value_vitalita:.4f}")
+    print(f"Significatività (P<0.05): {'Sì' if p_value_vitalita < 0.05 else 'No'}")
+
+# --- 7.2 Test Post-Hoc di Tukey (TNC) ---
+
+print("\n\n--- 7.2 Test Post-Hoc di Tukey per TNC_Normalizzato ---")
+try:
+    tukey_tnc = pairwise_tukeyhsd(endog=df_crasco_filtered['TNC_Normalizzato'],
+                                  groups=df_crasco_filtered['CRASCO'],
+                                  alpha=0.05)
+
+    print("Risultati del Test di Tukey HSD per TNC_Normalizzato (solo Differenze Significative):")
+
+    significant_tnc = [tuple(row) for row in tukey_tnc._results_table.data[1:] if row[-1] == True]
+
+    if significant_tnc:
+        df_tukey_tnc = pd.DataFrame(significant_tnc, columns=['CRASCO 1', 'CRASCO 2', 'Differenza Media', 'Lower CI', 'Upper CI', 'p-adj', 'reject'])
+        df_tukey_tnc = df_tukey_tnc[['CRASCO 1', 'CRASCO 2', 'Differenza Media', 'p-adj']]
+
+        print(df_tukey_tnc.head(10).to_markdown(index=False, floatfmt=".4f"))
+        print(f"\n(Totale coppie significativamente diverse per TNC: {len(significant_tnc)})")
+    else:
+        print("Nessuna coppia significativamente diversa trovata per TNC_Normalizzato.")
+
+except ValueError as e:
+    print(f"ERRORE nell'esecuzione di Tukey TNC (Riprova dopo aver verificato i dati): {e}")
+
+
+# --- 7.3 Test Post-Hoc di Tukey (CD34) ---
+
+print("\n\n--- 7.3 Test Post-Hoc di Tukey per CD34_Normalizzato ---")
+try:
+    tukey_cd34 = pairwise_tukeyhsd(endog=df_crasco_filtered['CD34_Normalizzato'],
+                                   groups=df_crasco_filtered['CRASCO'],
+                                   alpha=0.05)
+
+    print("Risultati del Test di Tukey HSD per CD34_Normalizzato (solo Differenze Significative):")
+
+    significant_cd34 = [tuple(row) for row in tukey_cd34._results_table.data[1:] if row[-1] == True]
+
+    if significant_cd34:
+        df_tukey_cd34 = pd.DataFrame(significant_cd34, columns=['CRASCO 1', 'CRASCO 2', 'Differenza Media', 'Lower CI', 'Upper CI', 'p-adj', 'reject'])
+        df_tukey_cd34 = df_tukey_cd34[['CRASCO 1', 'CRASCO 2', 'Differenza Media', 'p-adj']]
+
+        print(df_tukey_cd34.head(10).to_markdown(index=False, floatfmt=".4f"))
+        print(f"\n(Totale coppie significativamente diverse per CD34: {len(significant_cd34)})")
+    else:
+        print("Nessuna coppia significativamente diversa trovata per CD34_Normalizzato.")
+
+except ValueError as e:
+    print(f"ERRORE nell'esecuzione di Tukey CD34 (Riprova dopo aver verificato i dati): {e}")
+
+
+# =========================================================================
+# === 🚨 SEZIONE 8: ANALISI PER AREA GEOGRAFICA (FINALE) 🚨 ===
+# =========================================================================
+
+# Mappatura dei CRASCO alle Nuove Aree Geografiche (Aggiornata al 10/10/2025)
+mappa_aree = {
+    # Napoli (Metropolitana) - 18 CRASCO
+    'FBF': 'Napoli (Metropolitana)', 'GIO': 'Napoli (Metropolitana)', 'PAO': 'Napoli (Metropolitana)',
+    'NOL': 'Napoli (Metropolitana)', 'POZ': 'Napoli (Metropolitana)', 'LEO': 'Napoli (Metropolitana)',
+    'VBT': 'Napoli (Metropolitana)', 'FED': 'Napoli (Metropolitana)', 'MED': 'Napoli (Metropolitana)',
+    'CIN': 'Napoli (Metropolitana)', 'RUE': 'Napoli (Metropolitana)', 'INT': 'Napoli (Metropolitana)',
+    'TRX': 'Napoli (Metropolitana)', 'TAS': 'Napoli (Metropolitana)', 'LOR': 'Napoli (Metropolitana)',
+    'GEN': 'Napoli (Metropolitana)', 'CAR': 'Napoli (Metropolitana)', 'SUN': 'Napoli (Metropolitana)',
+    'SOL': 'Napoli (Metropolitana)', 'ANN': 'Napoli (Metropolitana)', 'TRO': 'Napoli (Metropolitana)',
+
+    # Aree Insulari - 2 CRASCO
+    'RIZ': 'Aree Insulari', 'CPR': 'Aree Insulari', # Rizzoli (Ischia), Capri
+
+    # Casertano - 6 CRASCO
+    'SSB': 'Casertano', 'MRC': 'Casertano', 'MIC': 'Casertano', 'AVE': 'Casertano',
+    'MDD': 'Casertano', 'CAP': 'Casertano',
+
+    # Salerno (Agro-Cilento) - 7 CRASCO
+    'NOC': 'Salerno (Agro-Cilento)', 'SAR': 'Salerno (Agro-Cilento)',
+    'SAP': 'Salerno (Agro-Cilento)', 'BAT': 'Salerno (Agro-Cilento)',
+    'EBO': 'Salerno (Agro-Cilento)', 'RUG': 'Salerno (Agro-Cilento)', 'CAV': 'Salerno (Agro-Cilento)',
+    'SCA': 'Salerno (Agro-Cilento)', 'CUR': 'Salerno (Agro-Cilento)',
+
+    # Lucani 
+    'POL': 'Lucania (Lucani)', 'SAP': 'Lucania (Lucani)', 'VAL': 'Lucania (Lucani)',
+
+    # Sannio - Irpinia - 3 CRASCO
+    'SCG': 'Sannio - Irpinia', 'MOS': 'Sannio - Irpinia', 'SOF': 'Sannio - Irpinia', 'RUM': 'Sannio - Irpinia', 'ARP': 'Sannio - Irpinia',
+    'ANG': 'Sannio - Irpinia'
+}
+
+# Applichiamo la mappatura al dataframe filtrato (esclude EST)
+df_crasco_filtered['Area_Geografica'] = df_crasco_filtered['CRASCO'].map(mappa_aree).fillna('Altro')
+
+# Filtra per rimuovere 'Altro' e gruppi con conteggi insufficienti
+# Nota: "Altro" conterrà centri con count < 5 o quelli non mappati sopra (es. ARP, RUM, centri esterni non noti)
+df_area = df_crasco_filtered[df_crasco_filtered['Area_Geografica'] != 'Altro'].copy()
+df_area = df_area.groupby('Area_Geografica').filter(lambda x: len(x) >= 5) # Filtro >= 5 per ANOVA stabile
+
+
+print("\n===========================================================================================")
+print("ANALISI 8: CONFRONTO DELLA RESA E QUALITÀ PER AREA GEOGRAFICA (FINALE)")
+print("===========================================================================================\n")
+
+# --- 8.1 Statistiche Descrittive per Area Geografica ---
+print("--- 8.1 Statistiche Descrittive per Area Geografica ---\n")
+
+area_stats = df_area.groupby('Area_Geografica').agg(
+    Conteggio=('CRASCO', 'size'),
+    TNC_Media=('TNC_Normalizzato', 'mean'),
+    TNC_DS=('TNC_Normalizzato', 'std'),
+    CD34_Media=('CD34_Normalizzato', 'mean'),
+    CD34_DS=('CD34_Normalizzato', 'std'),
+    Vitalita_Media=('VITALITA_CD34', 'mean'),
+    Vitalita_DS=('VITALITA_CD34', 'std')
+).reset_index()
+
+
+print(area_stats.to_markdown(index=False, floatfmt=".2f"))
+
+# --- 8.2 ANOVA (Analisi della Varianza) per Varianza Inter-Area ---
+print("\n--- 8.2 ANOVA (Analisi della Varianza) per Varianza Inter-Area ---\n")
+
+
+# Gruppi per ANOVA
+aree_list = df_area['Area_Geografica'].unique()
+
+# Esegui l'ANOVA per TNC_Normalizzato
+groups_tnc = [df_area['TNC_Normalizzato'][df_area['Area_Geografica'] == area] for area in aree_list]
+f_tnc, p_tnc = f_oneway(*groups_tnc)
+
+# Esegui l'ANOVA per CD34_Normalizzato
+groups_cd34 = [df_area['CD34_Normalizzato'][df_area['Area_Geografica'] == area] for area in aree_list]
+f_cd34, p_cd34 = f_oneway(*groups_cd34)
+
+# Esegui l'ANOVA per Vitalita
+groups_vitalita = [df_area['VITALITA_CD34'][df_area['Area_Geografica'] == area] for area in aree_list]
+f_vitalita, p_vitalita = f_oneway(*groups_vitalita)
+
+anova_results_area = pd.DataFrame({
+    'Variabile': ['TNC_Normalizzato', 'CD34_Normalizzato', 'VITALITA_CD34'],
+    'P-value (ANOVA)': [p_tnc, p_cd34, p_vitalita],
+    'Significatività (P<0.05)': ['Sì' if p_tnc < 0.05 else 'No',
+                                 'Sì' if p_cd34 < 0.05 else 'No',
+                                 'Sì' if p_vitalita < 0.05 else 'No']
+})
+
+print(anova_results_area.to_markdown(index=False, floatfmt=".4f"))
